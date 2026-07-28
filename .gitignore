@@ -1,0 +1,28 @@
+# Binaries
+/trivial
+/trivial.exe
+*.exe
+
+# Local state
+*.db
+*.db-shm
+*.db-wal
+
+# Frontend
+node_modules/
+web/tsconfig.tsbuildinfo
+
+# web/dist is deliberately NOT ignored: go:embed pulls it into the binary, so a
+# plain `go build` works in a clone with no Node installed. Re-run
+# `npm run build` after any frontend change and commit the result.
+#
+# Source maps are the exception. They are four times the size of the bundle they
+# describe, are only useful against sources you already have, and would be the
+# bulk of every commit. Production builds do not emit them (see vite.config.ts);
+# this rule is a backstop if that is ever turned back on.
+web/dist/**/*.map
+
+# Editors
+.DS_Store
+.vscode/
+.idea/
