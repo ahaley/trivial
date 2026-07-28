@@ -1,0 +1,13 @@
+# The built frontend is committed so that `go build` works without Node, but it
+# is generated output, not source. Marking it as such keeps bundle diffs
+# collapsed in review and stops GitHub reporting this as a JavaScript project
+# on the strength of one minified file.
+web/dist/** linguist-generated=true
+
+# Normalise line endings so a checkout on Windows and one on Linux produce the
+# same bytes — the embedded assets are hashed by content, and CRLF churn would
+# show every build as a rewrite.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.ico binary
