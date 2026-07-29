@@ -19,6 +19,15 @@ import {
   relativeDay,
 } from "../components";
 
+// How long the "don't know" gesture must be held: Enter on an empty answer
+// field, or the button itself on touch devices. Matches the .dont-know.holding
+// fill transition in styles.css.
+const HOLD_MS = 600;
+
+// On coarse pointers the "Don't know" button requires a press-and-hold so a
+// stray tap near the options can't record a pass.
+const coarsePointer = window.matchMedia("(pointer: coarse)").matches;
+
 export function SessionPage() {
   const { id } = useParams();
   const sessionId = Number(id);
@@ -34,10 +43,30 @@ export function SessionPage() {
   const [response, setResponse] = useState("");
   const [choice, setChoice] = useState<number | null>(null);
 
+  // "Don't know": true while a pass gesture is being held (drives the button's
+  // fill animation), and whether the "hold ↵ to pass" hint is showing.
+  const [holding, setHolding] = useState(false);
+  const [hint, setHint] = useState(false);
+  const enterHoldTimer = useRef<number | null>(null);
+  const pressTimer = useRef<number | null>(null);
+  const hintTimer = useRef<number | null>(null);
+
   // When the question appeared, so the answer's latency can distinguish fluent
   // recall from laboured recall.
   const shownAt = useRef(Date.now());
   const inputRef = useRef<HTMLInputElement>(null);
+
+  const clearHold = useCallback(() => {
+    if (enterHoldTimer.current !== null) {
+      clearTimeout(enterHoldTimer.current);
+      enterHoldTimer.current = null;
+    }
+    if (pressTimer.current !== null) {
+      clearTimeout(pressTimer.current);
+      pressTimer.current = null;
+    }
+    setHolding(false);
+  }, []);
 
   const advance = useCallback(async () => {
     setBusy(true);
@@ -52,6 +81,8 @@ export function SessionPage() {
         setFeedback(null);
         setResponse("");
         setChoice(null);
+        clearHold();
+        setHint(false);
         shownAt.current = Date.now();
       }
       setError("");
@@ -60,7 +91,19 @@ export function SessionPage() {
     } finally {
       setBusy(false);
     }
-  }, [sessionId]);
+  }, [sessionId, clearHold]);
+
+  // A question change while a hold is in flight must not fire a stale pass.
+  useEffect(
+    () => () => {
+      clearHold();
+      if (hintTimer.current !== null) {
+        clearTimeout(hintTimer.current);
+        hintTimer.current = null;
+      }
+    },
+    [question, clearHold],
+  );
 
   useEffect(() => {
     void advance();
@@ -73,18 +116,21 @@ export function SessionPage() {
   }, [question, feedback]);
 
   const submit = useCallback(
-    async (pickedChoice?: number) => {
+    async (pickedChoice?: number | null, opts?: { pass?: boolean }) => {
       if (!question || feedback || busy) return;
+      const pass = opts?.pass ?? false;
       const picked = pickedChoice ?? choice;
-      if (question.mode === "mc" && picked === null) return;
-      if (question.mode === "open" && !response.trim()) return;
+      if (!pass && question.mode === "mc" && picked === null) return;
+      if (!pass && question.mode === "open" && !response.trim()) return;
 
       setBusy(true);
       try {
+        // A pass always submits an empty answer, even if something was typed;
+        // the server grades it incorrect without an LLM call.
         const result = await api.answer(sessionId, {
           question_id: question.id,
-          response: question.mode === "open" ? response : undefined,
-          choice: question.mode === "mc" ? picked : null,
+          response: question.mode === "open" ? (pass ? "" : response) : undefined,
+          choice: question.mode === "mc" && !pass ? picked : null,
           latency_ms: Date.now() - shownAt.current,
         });
         setFeedback(result);
@@ -100,21 +146,45 @@ export function SessionPage() {
     [question, feedback, busy, choice, response, sessionId],
   );
 
-  // Keyboard: 1–4 pick an option, Enter submits, Enter again moves on.
+  const passQuestion = useCallback(() => submit(null, { pass: true }), [submit]);
+
+  const cancelPress = useCallback(() => {
+    if (pressTimer.current !== null) {
+      clearTimeout(pressTimer.current);
+      pressTimer.current = null;
+    }
+    setHolding(false);
+  }, []);
+
+  const showHint = useCallback(() => {
+    setHint(true);
+    if (hintTimer.current !== null) clearTimeout(hintTimer.current);
+    hintTimer.current = window.setTimeout(() => setHint(false), 1600);
+  }, []);
+
+  // Keyboard: 1–4 pick an option, 0 passes, Enter submits, Enter again moves on.
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (e.metaKey || e.ctrlKey || e.altKey) return;
 
       if (feedback) {
         if (e.key === "Enter") {
+          // preventDefault even on repeats: an Enter still held from the pass
+          // gesture would otherwise activate the focused Next button and blow
+          // straight through the feedback. A fresh press is required to advance.
           e.preventDefault();
-          void advance();
+          if (!e.repeat) void advance();
         }
         return;
       }
       if (!question) return;
 
       if (question.mode === "mc") {
+        if (e.key === "0") {
+          e.preventDefault();
+          if (!e.repeat) void passQuestion();
+          return;
+        }
         const n = Number(e.key);
         if (n >= 1 && n <= (question.options?.length ?? 0)) {
           e.preventDefault();
@@ -125,9 +195,42 @@ export function SessionPage() {
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [question, feedback, advance, submit]);
+  }, [question, feedback, advance, submit, passQuestion]);
 
   if (summary) return <SessionSummary summary={summary} results={results} />;
+
+  // MC has no Answer button to fold the pass into, so it keeps a dedicated
+  // control below the option grid.
+  const dontKnow = question && !feedback && (
+    <button
+      type="button"
+      className={`btn ghost dont-know${holding ? " holding" : ""}`}
+      disabled={busy}
+      onClick={(e) => {
+        // On touch, taps must go through the press-and-hold path below;
+        // e.detail === 0 means keyboard activation, which is always allowed.
+        if (coarsePointer && e.detail > 0) return;
+        void passQuestion();
+      }}
+      onPointerDown={(e) => {
+        if (!coarsePointer || e.button !== 0) return;
+        setHolding(true);
+        pressTimer.current = window.setTimeout(() => {
+          pressTimer.current = null;
+          setHolding(false);
+          void passQuestion();
+        }, HOLD_MS);
+      }}
+      onPointerUp={cancelPress}
+      onPointerLeave={cancelPress}
+      onPointerCancel={cancelPress}
+      onContextMenu={(e) => {
+        if (coarsePointer) e.preventDefault();
+      }}
+    >
+      Don’t know <span className="kbd">0</span>
+    </button>
+  );
 
   return (
     <main className="narrow">
@@ -157,22 +260,25 @@ export function SessionPage() {
           <h2 className="question">{question.prompt}</h2>
 
           {question.mode === "mc" ? (
-            <div className="options">
-              {question.options?.map((opt, i) => (
-                <button
-                  key={i}
-                  className={optionClass(i, choice, feedback)}
-                  disabled={!!feedback || busy}
-                  onClick={() => {
-                    setChoice(i);
-                    void submit(i);
-                  }}
-                >
-                  <span className="key">{i + 1}</span>
-                  <span>{opt}</span>
-                </button>
-              ))}
-            </div>
+            <>
+              <div className="options">
+                {question.options?.map((opt, i) => (
+                  <button
+                    key={i}
+                    className={optionClass(i, choice, feedback)}
+                    disabled={!!feedback || busy}
+                    onClick={() => {
+                      setChoice(i);
+                      void submit(i);
+                    }}
+                  >
+                    <span className="key">{i + 1}</span>
+                    <span>{opt}</span>
+                  </button>
+                ))}
+              </div>
+              {dontKnow && <div className="dont-know-row">{dontKnow}</div>}
+            </>
           ) : (
             <form
               className="answer-form"
@@ -185,26 +291,88 @@ export function SessionPage() {
                 ref={inputRef}
                 className="input"
                 value={response}
-                onChange={(e) => setResponse(e.target.value)}
+                onChange={(e) => {
+                  setResponse(e.target.value);
+                  clearHold();
+                }}
+                onKeyDown={(e) => {
+                  // An empty field disables the submit button, so Enter is
+                  // otherwise inert here: holding it becomes the pass gesture.
+                  if (e.key !== "Enter" || feedback || busy) return;
+                  if (response.trim()) return;
+                  e.preventDefault();
+                  if (e.repeat) return;
+                  setHolding(true);
+                  enterHoldTimer.current = window.setTimeout(() => {
+                    enterHoldTimer.current = null;
+                    setHolding(false);
+                    void passQuestion();
+                  }, HOLD_MS);
+                }}
+                onKeyUp={(e) => {
+                  if (e.key !== "Enter") return;
+                  if (enterHoldTimer.current !== null) {
+                    // Released early: no pass, just teach the gesture.
+                    clearHold();
+                    showHint();
+                  }
+                }}
                 placeholder="Answer from memory"
                 disabled={!!feedback || busy}
                 autoComplete="off"
                 spellCheck={false}
               />
               {!feedback && (
-                <button className="btn" type="submit" disabled={busy || !response.trim()}>
-                  {busy ? "Checking…" : "Answer"}
-                  <span className="kbd">↵</span>
+                <button
+                  className={`btn dont-know answer-submit${holding ? " holding" : ""}`}
+                  type="submit"
+                  disabled={busy}
+                  onClick={(e) => {
+                    // Keyboard/AT activation with an empty field: teach the
+                    // gesture rather than silently doing nothing.
+                    if (!response.trim() && e.detail === 0) {
+                      e.preventDefault();
+                      showHint();
+                    }
+                  }}
+                  onPointerDown={(e) => {
+                    if (e.button !== 0 || response.trim() || busy) return;
+                    setHolding(true);
+                    pressTimer.current = window.setTimeout(() => {
+                      pressTimer.current = null;
+                      setHolding(false);
+                      void passQuestion();
+                    }, HOLD_MS);
+                  }}
+                  onPointerUp={() => {
+                    // Released before the threshold: no pass, teach the gesture.
+                    if (pressTimer.current !== null) {
+                      cancelPress();
+                      showHint();
+                    }
+                  }}
+                  onPointerLeave={cancelPress}
+                  onPointerCancel={cancelPress}
+                  onContextMenu={(e) => {
+                    if (coarsePointer) e.preventDefault();
+                  }}
+                >
+                  {holding ? "Don’t know" : busy ? "Checking…" : "Answer"}
+                  {!holding && <span className="kbd">↵</span>}
                 </button>
               )}
             </form>
           )}
 
           {!feedback && (
-            <p className="mode-note">
-              {question.mode === "open"
-                ? "Recall — type what you remember"
-                : "Recognise — press 1 to 4"}
+            <p className={`mode-note${hint ? " hint-flash" : ""}`} aria-live="polite">
+              {hint
+                ? coarsePointer
+                  ? "Hold the button to pass"
+                  : "Hold ↵ to pass"
+                : question.mode === "open"
+                  ? "Recall — type what you remember"
+                  : "Recognise — press 1 to 4"}
             </p>
           )}
 
