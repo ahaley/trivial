@@ -3,6 +3,7 @@ import { NavLink, Route, Routes } from "react-router-dom";
 import { BrandMark } from "./components";
 import { Dashboard } from "./pages/Dashboard";
 import { SessionPage } from "./pages/Session";
+import { SettingsPage } from "./pages/Settings";
 import { TopicPage } from "./pages/Topic";
 import { TopicsPage } from "./pages/Topics";
 
@@ -19,6 +20,7 @@ export function App() {
             Topics
           </NavLink>
           <NavLink to="/progress">Progress</NavLink>
+          <NavLink to="/settings">Settings</NavLink>
         </nav>
       </header>
 
@@ -27,6 +29,7 @@ export function App() {
         <Route path="/topics/:id" element={<TopicPage />} />
         <Route path="/sessions/:id" element={<SessionPage />} />
         <Route path="/progress" element={<Dashboard />} />
+        <Route path="/settings" element={<SettingsPage />} />
         <Route path="*" element={<NotFound />} />
       </Routes>
     </div>

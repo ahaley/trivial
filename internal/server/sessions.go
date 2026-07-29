@@ -244,7 +244,16 @@ func (s *Server) handleAnswer(w http.ResponseWriter, r *http.Request) {
 		}
 	default:
 		recorded = strings.TrimSpace(req.Response)
-		verdict = s.tutor.GradeOpen(r.Context(), subject, f, q.Prompt, recorded)
+		aiOn, err := s.store.AIEnabled()
+		if err != nil {
+			s.log.Warn("could not read settings; assuming AI grading on", "err", err)
+			aiOn = true
+		}
+		if aiOn {
+			verdict = s.tutor.GradeOpen(r.Context(), subject, f, q.Prompt, recorded)
+		} else {
+			verdict = tutor.GradeOpenLocal(f, recorded)
+		}
 	}
 
 	now := time.Now()

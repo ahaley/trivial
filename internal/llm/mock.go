@@ -111,7 +111,7 @@ func (m *Mock) grade(req Request) (string, error) {
 	canonical := req.Var("answer")
 	response := req.Var("response")
 
-	sim := similarity(canonical, response)
+	sim := Similarity(canonical, response)
 	verdict, critique := "incorrect", "That does not match the expected answer."
 	switch {
 	case sim >= 0.8:
@@ -145,9 +145,11 @@ func hash(s string) uint32 {
 	return h.Sum32()
 }
 
-// similarity is Jaccard overlap over normalised word sets, with exact
-// containment treated as a full match.
-func similarity(a, b string) float64 {
+// Similarity is Jaccard overlap over normalised word sets, with exact
+// containment treated as a full match. It grades the mock provider's answers,
+// and is also the word-overlap grader tutor uses when AI grading is switched
+// off or the model is unreachable.
+func Similarity(a, b string) float64 {
 	aw, bw := words(a), words(b)
 	if len(aw) == 0 || len(bw) == 0 {
 		return 0

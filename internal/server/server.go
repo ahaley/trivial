@@ -95,6 +95,9 @@ func (s *Server) Handler() http.Handler {
 
 		r.Get("/stats", s.handleStats)
 
+		r.Get("/settings", s.handleGetSettings)
+		r.Put("/settings", s.handlePutSettings)
+
 		r.NotFound(func(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "no such endpoint")
 		})

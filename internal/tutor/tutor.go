@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"unicode"
 
 	"github.com/ahaley/trivial/internal/fsrs"
 	"github.com/ahaley/trivial/internal/llm"
@@ -60,7 +59,7 @@ func GradeMC(q model.Question, choice int) Verdict {
 
 // GradeOpen grades a free-text answer against the fact's canonical answer.
 // An empty response is incorrect without troubling the model. If the model call
-// fails, grading degrades to a conservative local comparison rather than
+// fails, grading degrades to the local word-overlap comparison rather than
 // failing the whole answer submission.
 func (t *Tutor) GradeOpen(ctx context.Context, subject string, f model.Fact, question, response string) Verdict {
 	response = strings.TrimSpace(response)
@@ -101,20 +100,34 @@ func (t *Tutor) GradeOpen(ctx context.Context, subject string, f model.Fact, que
 	}
 
 	t.log.Warn("falling back to local grading", "fact", f.ID, "err", err)
-	return localVerdict(f, response)
+	return GradeOpenLocal(f, response)
 }
 
-// localVerdict is the offline fallback: exact-ish match only. It deliberately
-// never awards a partial grade, since without the model it cannot tell a
-// half-right answer from a wrong one.
-func localVerdict(f model.Fact, response string) Verdict {
-	if normalize(response) == normalize(f.CanonicalAnswer) {
-		return Verdict{Grade: model.GradeCorrect, Critique: "Correct."}
+// GradeOpenLocal grades a free-text answer without the model: word-overlap
+// similarity against the canonical answer. It is the grader when AI grading
+// is switched off, and the fallback when the model is unreachable.
+func GradeOpenLocal(f model.Fact, response string) Verdict {
+	response = strings.TrimSpace(response)
+	if response == "" {
+		return Verdict{
+			Grade:    model.GradeIncorrect,
+			Critique: fmt.Sprintf("No answer given. The answer is %s. %s", f.CanonicalAnswer, f.Explanation),
+		}
 	}
-	return Verdict{
-		Grade: model.GradeIncorrect,
-		Critique: fmt.Sprintf("Graded offline, so only an exact match counts. The answer is %s. %s",
-			f.CanonicalAnswer, f.Explanation),
+	switch sim := llm.Similarity(f.CanonicalAnswer, response); {
+	case sim >= 0.8:
+		return Verdict{Grade: model.GradeCorrect, Critique: "Correct."}
+	case sim >= 0.35:
+		return Verdict{
+			Grade: model.GradePartial,
+			Critique: fmt.Sprintf("Partly right — the expected answer is %s. %s",
+				f.CanonicalAnswer, f.Explanation),
+		}
+	default:
+		return Verdict{
+			Grade:    model.GradeIncorrect,
+			Critique: fmt.Sprintf("Not quite. The answer is %s. %s", f.CanonicalAnswer, f.Explanation),
+		}
 	}
 }
 
@@ -186,14 +199,4 @@ func parseGrade(s string) (model.Grade, bool) {
 		return model.GradeIncorrect, true
 	}
 	return "", false
-}
-
-// normalize reduces an answer to a comparison form: lowercase, letters and
-// digits only, single-spaced. Categories rather than ASCII ranges, so accented
-// letters are kept but every flavour of punctuation is dropped.
-func normalize(s string) string {
-	fields := strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
-		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
-	})
-	return strings.Join(fields, " ")
 }

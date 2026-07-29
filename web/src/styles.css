@@ -303,6 +303,42 @@ h2 {
   letter-spacing: 0;
 }
 
+/* ---------- segmented control ---------- */
+
+.segment {
+  display: inline-flex;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.segment button {
+  padding: 0.45rem 1.1rem;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  transition: background 120ms var(--ease);
+}
+
+.segment button + button {
+  border-left: 1px solid var(--rule);
+}
+
+.segment button.on {
+  background: var(--signal-soft);
+  color: var(--signal);
+}
+
+.segment button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 /* ---------- forms ---------- */
 
 .field {

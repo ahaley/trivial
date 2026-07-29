@@ -158,6 +158,11 @@ export interface Stats {
   topics: { topic_id: number; subject: string; facts: number; due: number; mastery: number }[] | null;
 }
 
+export interface Settings {
+  /** When false, open-ended answers are graded by word matching, not the AI. */
+  ai_enabled: boolean;
+}
+
 /** ApiError carries the server's message so the UI can show it verbatim. */
 export class ApiError extends Error {
   constructor(
@@ -233,4 +238,8 @@ export const api = {
     request<{ elaboration: string }>("POST", `/attempts/${attemptId}/explain`),
 
   stats: () => request<Stats>("GET", "/stats"),
+
+  getSettings: () => request<Settings>("GET", "/settings"),
+
+  putSettings: (s: Settings) => request<Settings>("PUT", "/settings", s),
 };

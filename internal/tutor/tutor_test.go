@@ -114,8 +114,45 @@ func TestGradeOpenFallsBackWhenModelFails(t *testing.T) {
 	if v.Grade != model.GradeIncorrect {
 		t.Errorf("a wrong answer should be incorrect offline, got %q", v.Grade)
 	}
-	if !strings.Contains(v.Critique, "offline") {
-		t.Errorf("the learner should be told grading was degraded, got %q", v.Critique)
+	if !strings.Contains(v.Critique, "Mylae") {
+		t.Errorf("critique should reveal the answer, got %q", v.Critique)
+	}
+}
+
+func TestGradeOpenLocal(t *testing.T) {
+	cases := []struct {
+		name     string
+		response string
+		want     model.Grade
+	}{
+		{"exact match", "Mylae", model.GradeCorrect},
+		{"containment", "the Battle of Mylae", model.GradeCorrect},
+		{"unrelated", "Actium", model.GradeIncorrect},
+		{"empty", "   ", model.GradeIncorrect},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			v := GradeOpenLocal(fact, c.response)
+			if v.Grade != c.want {
+				t.Errorf("GradeOpenLocal(%q) = %q, want %q", c.response, v.Grade, c.want)
+			}
+			if v.Grade != model.GradeCorrect && !strings.Contains(v.Critique, "Mylae") {
+				t.Errorf("critique should reveal the answer, got %q", v.Critique)
+			}
+		})
+	}
+
+	// Word overlap without containment: a multi-word answer answered half-right.
+	partial := model.Fact{
+		CanonicalAnswer: "Gaius Duilius commanded the fleet",
+		Explanation:     "He won at Mylae in 260 BC.",
+	}
+	v := GradeOpenLocal(partial, "Duilius commanded the army")
+	if v.Grade != model.GradePartial {
+		t.Errorf("half-overlapping answer should be partial, got %q", v.Grade)
+	}
+	if !strings.Contains(v.Critique, partial.CanonicalAnswer) {
+		t.Errorf("partial critique should name the expected answer, got %q", v.Critique)
 	}
 }
 
