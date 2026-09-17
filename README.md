@@ -30,14 +30,20 @@ git clone https://github.com/ahaley/trivial
 cd trivial
 go build -o trivial ./cmd/trivial
 
-# Point it at a Google Cloud service account and run
-export TRIVIAL_VERTEX_CREDENTIALS=/path/to/service-account.json
+# Sign in to Google Cloud — no key file to download or keep safe
+gcloud auth application-default login
+gcloud config set project my-project     # if you have not already
+
 ./trivial serve --host localhost:1234
 ```
 
 Open <http://localhost:1234>, create a topic, and start a session.
 
-**No credentials to hand?** Run with `--llm-provider mock` to explore the whole
+**On a server, or prefer a key file?**
+`export TRIVIAL_VERTEX_CREDENTIALS=/path/to/service-account.json` instead — see
+[Credentials](#credentials) for the full list of ways to authenticate.
+
+**No Google Cloud at all?** Run with `--llm-provider mock` to explore the whole
 app offline against a synthetic deck. The content is obvious filler, but
 generation, quizzing, grading and scheduling all work.
 
@@ -69,7 +75,7 @@ Highest precedence first: flags, environment, config file, defaults.
 | Provider | `TRIVIAL_LLM_PROVIDER` | `vertex` (or `gemini`, `mock`) |
 | Model | `TRIVIAL_LLM_MODEL` | `gemini-3.5-flash` |
 | Credentials | `TRIVIAL_VERTEX_CREDENTIALS` | application default credentials |
-| Project | `TRIVIAL_VERTEX_PROJECT` | from the credentials |
+| Project | `TRIVIAL_VERTEX_PROJECT` | from the credentials, else gcloud's |
 | Region | `TRIVIAL_VERTEX_LOCATION` | `global` |
 | API key (`gemini` only) | `TRIVIAL_LLM_API_KEY` | — |
 
@@ -93,23 +99,45 @@ out why a setting is not what you expected.
 
 ### Credentials
 
-`TRIVIAL_VERTEX_CREDENTIALS` (or `--vertex-credentials`) points Trivial at its
-own service account without touching `GOOGLE_APPLICATION_CREDENTIALS`, which is
-process-wide and may already be set for something else on the machine. Where
-both are set, Trivial's wins.
+Trivial takes the first of these that answers. There is nothing to choose
+between them — whichever you have set up is the one that gets used.
 
-Leave it unset and credentials resolve in the usual Application Default
-Credentials order instead, so `GOOGLE_APPLICATION_CREDENTIALS`,
-`gcloud auth application-default login`, and an attached GCE/Cloud Run identity
-all work. Access tokens are refreshed automatically either way.
+| | Set up with | Best for |
+|---|---|---|
+| 1 | `TRIVIAL_VERTEX_CREDENTIALS` / `--vertex-credentials` | a service account key just for Trivial |
+| 2 | `GOOGLE_APPLICATION_CREDENTIALS` | a machine already configured for something else |
+| 3 | `gcloud auth application-default login` | your own workstation — no key file to leak |
+| 4 | the attached identity | running on GCE, Cloud Run or GKE |
 
-The project is taken from the credentials; override with `--vertex-project` or
-`TRIVIAL_VERTEX_PROJECT`. The service account needs the **Vertex AI User** role
-(`roles/aiplatform.user`), and `aiplatform.googleapis.com` must be enabled.
+(1) exists so Trivial can have its own service account without touching
+`GOOGLE_APPLICATION_CREDENTIALS`, which is process-wide and may already point
+somewhere else. Where both are set, Trivial's wins. Access tokens are refreshed
+automatically in every case.
 
-`trivial config --llm-provider vertex` prints the resolved project, region and
-credential source, which is the fastest way to diagnose a setup problem without
-making a billed request.
+Whichever identity you use needs the **Vertex AI User** role
+(`roles/aiplatform.user`) on the project, and `aiplatform.googleapis.com` must
+be enabled. That applies to your own account exactly as it does to a service
+account.
+
+**A gcloud login needs a project from somewhere.** A service account key names
+the project it belongs to; the credentials `gcloud auth application-default
+login` writes do not name one at all. So for (3) Trivial takes the first of:
+the quota project attached to the login — recent gcloud versions add one for
+you, and `gcloud auth application-default set-quota-project` sets it
+afterwards — then `CLOUDSDK_CORE_PROJECT`, then gcloud's own configured project
+(`gcloud config set project my-project`). `TRIVIAL_VERTEX_PROJECT` (or
+`--vertex-project`) overrides all of it.
+
+`trivial config` prints which credential answered and which project it resolved
+to, and makes no billed request:
+
+```
+provider      vertex
+model         gemini-3.5-flash
+project       my-project (from gcloud config)
+location      global
+credentials   gcloud user login (gcloud account you@example.com)
+```
 
 ### When a model 404s
 

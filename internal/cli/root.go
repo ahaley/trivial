@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
-	"golang.org/x/oauth2/google"
 
 	"github.com/ahaley/trivial/internal/config"
 	"github.com/ahaley/trivial/internal/llm"
@@ -92,28 +92,9 @@ func newLLM(cfg config.Config) (llm.Client, error) {
 	})
 }
 
-// credentialSource reports where the Vertex credentials will come from, so a
-// misconfiguration is diagnosable without making a billed request. configured
-// is the resolved --vertex-credentials setting.
-func credentialSource(configured string) string {
-	if configured != "" {
-		if _, err := os.Stat(configured); err != nil {
-			return fmt.Sprintf("%s (MISSING)", configured)
-		}
-		return configured
-	}
-	// Nothing app-specific set, so report which part of the ADC chain answers.
-	if p := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); p != "" {
-		if _, err := os.Stat(p); err != nil {
-			return fmt.Sprintf("%s (MISSING, from GOOGLE_APPLICATION_CREDENTIALS)", p)
-		}
-		return p + " (from GOOGLE_APPLICATION_CREDENTIALS)"
-	}
-	if _, err := google.FindDefaultCredentials(context.Background(),
-		"https://www.googleapis.com/auth/cloud-platform"); err != nil {
-		return "(none found — set TRIVIAL_VERTEX_CREDENTIALS)"
-	}
-	return "(application default credentials)"
+// indent aligns a multi-line diagnostic under the label it follows.
+func indent(s string) string {
+	return strings.ReplaceAll(s, "\n", "\n              ")
 }
 
 // mask reduces a secret to a recognisable stub.
@@ -132,6 +113,32 @@ func orDefault(s, fallback string) string {
 		return fallback
 	}
 	return s
+}
+
+// printVertexAuth reports which credential will answer and which project it
+// addresses, resolving them exactly as the provider does but without making a
+// billed request.
+//
+// A resolution failure is printed rather than returned: `trivial config` is
+// what you reach for because authentication is broken, so it has to still run.
+func printVertexAuth(ctx context.Context, cfg config.Config) {
+	auth, err := llm.ResolveVertexAuth(ctx, llm.Options{
+		Project:         cfg.VertexProject,
+		Location:        cfg.VertexLocation,
+		CredentialsFile: cfg.VertexCredentials,
+	})
+	if err != nil {
+		fmt.Printf("project       %s\n", orDefault(cfg.VertexProject, "(unresolved)"))
+		fmt.Printf("location      %s\n", cfg.VertexLocation)
+		fmt.Printf("credentials   %s\n", indent(err.Error()))
+		return
+	}
+	fmt.Printf("project       %s (from %s)\n", auth.Project, auth.ProjectFrom)
+	fmt.Printf("location      %s\n", cfg.VertexLocation)
+	fmt.Printf("credentials   %s\n", auth.Source)
+	if auth.QuotaProject != "" {
+		fmt.Printf("quota project %s\n", auth.QuotaProject)
+	}
 }
 
 // configCmd prints the resolved configuration, which is the quickest way to see
@@ -154,9 +161,7 @@ func configCmd() *cobra.Command {
 
 			switch cfg.Provider {
 			case llm.ProviderVertex:
-				fmt.Printf("project       %s\n", orDefault(cfg.VertexProject, "(from credentials)"))
-				fmt.Printf("location      %s\n", cfg.VertexLocation)
-				fmt.Printf("credentials   %s\n", credentialSource(cfg.VertexCredentials))
+				printVertexAuth(cmd.Context(), cfg)
 			case llm.ProviderMock:
 				// The mock needs no credentials; saying so avoids a false alarm.
 				fmt.Printf("credentials   (not needed)\n")

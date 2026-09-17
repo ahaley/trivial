@@ -46,30 +46,20 @@ func NewVertex(ctx context.Context, opts Options) (Client, error) {
 		model = DefaultModel
 	}
 
-	creds, err := vertexCredentials(ctx, opts.CredentialsFile)
+	auth, err := ResolveVertexAuth(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
 
-	// Fall back to the project the credentials themselves name, so a service
-	// account key usually needs no project setting at all.
-	project := opts.Project
-	if project == "" {
-		project = creds.ProjectID
-	}
-	if project == "" {
-		return nil, errors.New(
-			"vertex: no project ID — set TRIVIAL_VERTEX_PROJECT, or use credentials that name one")
-	}
-
 	// oauth2's client attaches and refreshes the bearer token itself.
-	httpClient := oauth2.NewClient(ctx, creds.TokenSource)
+	httpClient := oauth2.NewClient(ctx, auth.TokenSource)
 	httpClient.Timeout = 3 * time.Minute
 
 	return &googleClient{
-		name:         fmt.Sprintf("vertex/%s (%s, %s)", model, project, location),
-		url:          VertexURL(opts.Endpoint, project, location, model),
+		name:         fmt.Sprintf("vertex/%s (%s, %s)", model, auth.Project, location),
+		url:          VertexURL(opts.Endpoint, auth.Project, location, model),
 		http:         httpClient,
+		userProject:  auth.QuotaProject,
 		notFoundHint: notFoundHint(location),
 		// No API key: the transport carries the credentials.
 	}, nil
@@ -91,6 +81,123 @@ func notFoundHint(location string) string {
 // adcEnvVar is the process-wide variable the Google libraries read a
 // credentials path from.
 const adcEnvVar = "GOOGLE_APPLICATION_CREDENTIALS"
+
+// VertexAuth is the resolved answer to who Trivial authenticates as and which
+// project it bills.
+type VertexAuth struct {
+	// TokenSource mints and refreshes the bearer token.
+	TokenSource oauth2.TokenSource
+	// Project is the GCP project Vertex requests are addressed to.
+	Project string
+	// ProjectFrom names where Project came from, for diagnostics.
+	ProjectFrom string
+	// Source describes the credential in terms a user can act on.
+	Source string
+	// QuotaProject is the project API usage is billed to, sent as
+	// x-goog-user-project. It is only ever the quota_project_id the credentials
+	// themselves name — see googleClient.userProject.
+	QuotaProject string
+}
+
+// ResolveVertexAuth works out which credential answers and which project it
+// addresses, without making a request.
+//
+// Every caller goes through here, so that `trivial config` reports exactly what
+// `trivial serve` will use.
+func ResolveVertexAuth(ctx context.Context, opts Options) (VertexAuth, error) {
+	// Read before vertexCredentials, which overwrites it for an explicit path.
+	ambient := os.Getenv(adcEnvVar)
+
+	creds, err := vertexCredentials(ctx, opts.CredentialsFile)
+	if err != nil {
+		return VertexAuth{}, err
+	}
+	file := parseCredentialsJSON(creds.JSON)
+	gcloud := readGcloudConfig()
+
+	auth := VertexAuth{
+		TokenSource:  creds.TokenSource,
+		Source:       describeCredentials(opts.CredentialsFile, ambient, file, gcloud),
+		QuotaProject: file.QuotaProjectID,
+	}
+
+	// A service account key and the metadata server both name their project;
+	// the file gcloud's application-default login writes does not, so the rest
+	// of this chain exists to find one for a user login.
+	switch {
+	case opts.Project != "":
+		auth.Project, auth.ProjectFrom = opts.Project, "configuration"
+	case creds.ProjectID != "":
+		auth.Project, auth.ProjectFrom = creds.ProjectID, "the credentials"
+	case file.QuotaProjectID != "":
+		auth.Project, auth.ProjectFrom = file.QuotaProjectID, "the quota project"
+	case os.Getenv(gcloudProjectEnvVar) != "":
+		auth.Project, auth.ProjectFrom = os.Getenv(gcloudProjectEnvVar), gcloudProjectEnvVar
+	case gcloud.Project != "":
+		auth.Project, auth.ProjectFrom = gcloud.Project, "gcloud config"
+	default:
+		return VertexAuth{}, errNoVertexProject
+	}
+	return auth, nil
+}
+
+// errNoVertexProject names every way out, because the likeliest reader of it
+// has a working gcloud login and no idea why that is not enough.
+var errNoVertexProject = errors.New("vertex: no project ID.\n" +
+	"  A gcloud user login does not name a project, so give it one:\n" +
+	"    gcloud config set project <project>\n" +
+	"    TRIVIAL_VERTEX_PROJECT=<project>   (or --vertex-project <project>)\n" +
+	"  A service account key names its own: --vertex-credentials <key.json>")
+
+// credentialsJSON is the part of a credentials file Trivial reads for itself —
+// the fields x/oauth2 parses but does not expose on google.Credentials.
+type credentialsJSON struct {
+	Type           string `json:"type"`
+	ClientEmail    string `json:"client_email"`
+	QuotaProjectID string `json:"quota_project_id"`
+}
+
+func parseCredentialsJSON(raw []byte) credentialsJSON {
+	var f credentialsJSON
+	if len(raw) > 0 {
+		// A credential that will not parse here still authenticates fine; this
+		// only feeds diagnostics, so a failure is not worth an error.
+		_ = json.Unmarshal(raw, &f)
+	}
+	return f
+}
+
+// describeCredentials says which credential answered and where it came from.
+//
+// gcloud's configured account is reported for a user login only when the login
+// is the one gcloud itself wrote, and is labelled as coming from gcloud,
+// because it is gcloud's CLI account rather than a field of the credential.
+func describeCredentials(path, ambient string, file credentialsJSON, gcloud gcloudConfig) string {
+	wellKnown := path == "" && ambient == ""
+
+	var who string
+	switch file.Type {
+	case "service_account":
+		who = "service account " + file.ClientEmail
+	case "authorized_user":
+		who = "gcloud user login"
+		if wellKnown && gcloud.Account != "" {
+			who += " (gcloud account " + gcloud.Account + ")"
+		}
+	case "":
+		return "GCE/Cloud Run attached identity"
+	default:
+		who = file.Type
+	}
+
+	switch {
+	case path != "":
+		return who + " — " + path
+	case ambient != "":
+		return who + " — " + ambient + " (from " + adcEnvVar + ")"
+	}
+	return who + " — application default credentials"
+}
 
 // vertexCredentials loads the service account named by path, falling back to
 // Application Default Credentials when no path is given.
@@ -117,7 +224,11 @@ func vertexCredentials(ctx context.Context, path string) (*google.Credentials, e
 
 	creds, err := google.FindDefaultCredentials(ctx, vertexScope)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrNoCredentials, err)
+		return nil, fmt.Errorf("%w: %w\n"+
+			"  Sign in with:  gcloud auth application-default login\n"+
+			"  Or name a service account key:  TRIVIAL_VERTEX_CREDENTIALS=<key.json>\n"+
+			"  Or try the app with no credentials at all:  --llm-provider mock",
+			ErrNoCredentials, err)
 	}
 	return creds, nil
 }
@@ -142,12 +253,12 @@ func ListVertexModels(ctx context.Context, opts Options) ([]VertexModel, error) 
 	if location == "" {
 		location = DefaultVertexLocation
 	}
-	creds, err := vertexCredentials(ctx, opts.CredentialsFile)
+	auth, err := ResolveVertexAuth(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
 
-	client := oauth2.NewClient(ctx, creds.TokenSource)
+	client := oauth2.NewClient(ctx, auth.TokenSource)
 	client.Timeout = 60 * time.Second
 
 	host := "aiplatform.googleapis.com"
@@ -161,6 +272,11 @@ func ListVertexModels(ctx context.Context, opts Options) ([]VertexModel, error) 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
+	}
+	// This URL names no project, so a user credential has nothing to bill
+	// against unless the quota project says so.
+	if auth.QuotaProject != "" {
+		req.Header.Set(userProjectHeader, auth.QuotaProject)
 	}
 	resp, err := client.Do(req)
 	if err != nil {

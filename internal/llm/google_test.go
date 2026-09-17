@@ -19,10 +19,11 @@ import (
 
 // capture records what the fake Google endpoint received.
 type capture struct {
-	path   string
-	apiKey string
-	auth   string
-	body   geminiRequest
+	path        string
+	apiKey      string
+	auth        string
+	userProject string
+	body        geminiRequest
 }
 
 // stubServer answers with reply, recording the request. status codes are
@@ -35,6 +36,7 @@ func stubServer(t *testing.T, got *capture, reply string, statuses ...int) *http
 		got.path = r.URL.Path
 		got.apiKey = r.Header.Get("x-goog-api-key")
 		got.auth = r.Header.Get("Authorization")
+		got.userProject = r.Header.Get(userProjectHeader)
 		json.NewDecoder(r.Body).Decode(&got.body)
 
 		n := int(calls.Add(1)) - 1
@@ -144,12 +146,76 @@ func writeServiceAccount(t *testing.T, project string) string {
 }
 
 // isolateADC clears the ambient credentials environment and restores it
-// afterwards. NewVertex writes GOOGLE_APPLICATION_CREDENTIALS when given an
-// explicit path, so without this a test would leak into whichever runs next.
-func isolateADC(t *testing.T) {
+// afterwards, returning the empty directory the tests may write a fake gcloud
+// installation into. NewVertex writes GOOGLE_APPLICATION_CREDENTIALS when given
+// an explicit path, so without this a test would leak into whichever runs next.
+//
+// APPDATA and HOME are redirected as well as CLOUDSDK_CONFIG: x/oauth2 looks
+// for the application-default login under those two directly and ignores
+// CLOUDSDK_CONFIG, so on a machine with a real gcloud login the tests would
+// otherwise authenticate as whoever is sitting at it.
+func isolateADC(t *testing.T) string {
 	t.Helper()
+	dir := t.TempDir()
 	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
-	t.Setenv("CLOUDSDK_CONFIG", t.TempDir()) // hide any real gcloud login
+	t.Setenv("CLOUDSDK_CONFIG", dir)
+	t.Setenv("CLOUDSDK_CORE_PROJECT", "")
+	t.Setenv("CLOUDSDK_ACTIVE_CONFIG_NAME", "")
+	t.Setenv("APPDATA", dir)
+	t.Setenv("HOME", dir)
+	return dir
+}
+
+// writeGcloudConfig lays down a gcloud configuration inside an isolated
+// CLOUDSDK_CONFIG directory.
+func writeGcloudConfig(t *testing.T, dir, name, body string) {
+	t.Helper()
+	confDir := filepath.Join(dir, "configurations")
+	if err := os.MkdirAll(confDir, 0o755); err != nil {
+		t.Fatalf("create gcloud config dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(confDir, "config_"+name), []byte(body), 0o600); err != nil {
+		t.Fatalf("write gcloud config: %v", err)
+	}
+}
+
+// userADCJSON is the shape `gcloud auth application-default login` writes.
+// Note what it does not have: a project_id. The refresh token is never
+// exchanged, because the token source is only built lazily.
+const userADCJSON = `{
+  "type": "authorized_user",
+  "client_id": "000000000000-notarealclient.apps.googleusercontent.com",
+  "client_secret": "not-a-real-secret",
+  "refresh_token": "1//not-a-real-refresh-token"%s
+}`
+
+// writeUserADC writes a gcloud user login at the well-known ADC path, with an
+// optional quota project.
+func writeUserADC(t *testing.T, dir, quotaProject string) {
+	t.Helper()
+	gcloudDir := filepath.Join(dir, "gcloud")
+	if err := os.MkdirAll(gcloudDir, 0o755); err != nil {
+		t.Fatalf("create gcloud dir: %v", err)
+	}
+	quota := ""
+	if quotaProject != "" {
+		quota = fmt.Sprintf(",\n  %q: %q", "quota_project_id", quotaProject)
+	}
+	body := fmt.Sprintf(userADCJSON, quota)
+	path := filepath.Join(gcloudDir, "application_default_credentials.json")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write user ADC: %v", err)
+	}
+	// x/oauth2 reads %APPDATA%/gcloud on Windows and $HOME/.config/gcloud
+	// elsewhere; write both so the test does not depend on GOOS.
+	unixDir := filepath.Join(dir, ".config", "gcloud")
+	if err := os.MkdirAll(unixDir, 0o755); err != nil {
+		t.Fatalf("create gcloud dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(unixDir, "application_default_credentials.json"),
+		[]byte(body), 0o600); err != nil {
+		t.Fatalf("write user ADC: %v", err)
+	}
 }
 
 // The app-specific credentials path must take precedence over the ambient
@@ -384,5 +450,158 @@ func TestNewSelectsProvider(t *testing.T) {
 	}
 	if _, err := New(ctx, Options{Provider: "nonsense"}); err == nil {
 		t.Error("an unknown provider should fail")
+	}
+}
+
+// The file a gcloud login writes names no project, so without a fallback a
+// perfectly good login cannot address Vertex at all.
+func TestVertexTakesProjectFromGcloudConfigForUserLogin(t *testing.T) {
+	dir := isolateADC(t)
+	writeUserADC(t, dir, "")
+	writeGcloudConfig(t, dir, "default", "[core]\naccount = someone@example.com\nproject = gcloud-project\n")
+
+	client, err := NewVertex(context.Background(), Options{Model: "m", Location: "us-central1"})
+	if err != nil {
+		t.Fatalf("NewVertex: %v", err)
+	}
+	if !strings.Contains(client.Name(), "gcloud-project") {
+		t.Errorf("Name() = %q, want the project from gcloud config", client.Name())
+	}
+}
+
+func TestVertexPrefersQuotaProjectOverGcloudConfig(t *testing.T) {
+	dir := isolateADC(t)
+	writeUserADC(t, dir, "quota-project")
+	writeGcloudConfig(t, dir, "default", "[core]\nproject = gcloud-project\n")
+
+	auth, err := ResolveVertexAuth(context.Background(), Options{})
+	if err != nil {
+		t.Fatalf("ResolveVertexAuth: %v", err)
+	}
+	if auth.Project != "quota-project" {
+		t.Errorf("Project = %q, want the credentials quota project", auth.Project)
+	}
+	if auth.QuotaProject != "quota-project" {
+		t.Errorf("QuotaProject = %q, want it carried through for the billing header", auth.QuotaProject)
+	}
+}
+
+func TestVertexExplicitProjectBeatsGcloudConfig(t *testing.T) {
+	dir := isolateADC(t)
+	writeUserADC(t, dir, "quota-project")
+	writeGcloudConfig(t, dir, "default", "[core]\nproject = gcloud-project\n")
+
+	auth, err := ResolveVertexAuth(context.Background(), Options{Project: "explicit-project"})
+	if err != nil {
+		t.Fatalf("ResolveVertexAuth: %v", err)
+	}
+	if auth.Project != "explicit-project" {
+		t.Errorf("Project = %q, want the configured project", auth.Project)
+	}
+}
+
+// The error a user login with no project hits has to name every way out of it,
+// because "your credentials are fine but nameless" is not a guessable state.
+func TestVertexWithNoProjectAnywhereNamesTheFixes(t *testing.T) {
+	dir := isolateADC(t)
+	writeUserADC(t, dir, "")
+
+	_, err := NewVertex(context.Background(), Options{Model: "m"})
+	if err == nil {
+		t.Fatal("a credential naming no project should fail at construction")
+	}
+	for _, want := range []string{"gcloud config set project", "TRIVIAL_VERTEX_PROJECT", "--vertex-credentials"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should mention %q, got:\n%s", want, err)
+		}
+	}
+}
+
+// A user login reports itself as one, so the user can tell at a glance whether
+// the credential in play is the one they think it is.
+func TestCredentialSourceNamesTheGcloudAccount(t *testing.T) {
+	dir := isolateADC(t)
+	writeUserADC(t, dir, "")
+	writeGcloudConfig(t, dir, "default", "[core]\naccount = someone@example.com\nproject = gcloud-project\n")
+
+	auth, err := ResolveVertexAuth(context.Background(), Options{})
+	if err != nil {
+		t.Fatalf("ResolveVertexAuth: %v", err)
+	}
+	if !strings.Contains(auth.Source, "gcloud user login") {
+		t.Errorf("Source = %q, want it to name the gcloud login", auth.Source)
+	}
+	if !strings.Contains(auth.Source, "someone@example.com") {
+		t.Errorf("Source = %q, want it to name the account", auth.Source)
+	}
+	if auth.ProjectFrom != "gcloud config" {
+		t.Errorf("ProjectFrom = %q, want %q", auth.ProjectFrom, "gcloud config")
+	}
+}
+
+func TestCredentialSourceNamesTheServiceAccount(t *testing.T) {
+	isolateADC(t)
+	auth, err := ResolveVertexAuth(context.Background(), Options{
+		CredentialsFile: writeServiceAccount(t, "key-project"),
+	})
+	if err != nil {
+		t.Fatalf("ResolveVertexAuth: %v", err)
+	}
+	if !strings.Contains(auth.Source, "service account trivial@key-project.iam.gserviceaccount.com") {
+		t.Errorf("Source = %q, want it to name the service account", auth.Source)
+	}
+	if auth.QuotaProject != "" {
+		t.Errorf("QuotaProject = %q, a service account key names none", auth.QuotaProject)
+	}
+}
+
+// A quota project is only sent when the credentials name one: inventing a value
+// for x-goog-user-project needs a permission the caller may not have, and would
+// turn a working request into a 403.
+func TestQuotaProjectIsSentOnlyWhenConfigured(t *testing.T) {
+	for _, tc := range []struct{ name, userProject, want string }{
+		{"configured", "quota-project", "quota-project"},
+		{"absent", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got capture
+			srv := stubServer(t, &got, `{"ok":true}`)
+
+			client := &googleClient{
+				name:        "vertex/gemini-test",
+				url:         VertexURL(srv.URL+"/v1", "p", "global", "gemini-test"),
+				http:        srv.Client(),
+				userProject: tc.userProject,
+			}
+			if _, err := client.Complete(context.Background(), sampleRequest()); err != nil {
+				t.Fatalf("complete: %v", err)
+			}
+			if got.userProject != tc.want {
+				t.Errorf("%s = %q, want %q", userProjectHeader, got.userProject, tc.want)
+			}
+		})
+	}
+}
+
+// The one 403 that is not an IAM problem must not be reported as one.
+func TestQuotaProjectForbiddenExplainsTheFix(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"error":{"code":403,"message":"Your application is authenticating by using ` +
+			`local Application Default Credentials. The aiplatform.googleapis.com API requires a quota project."}}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	client := &googleClient{
+		name: "vertex/gemini-test",
+		url:  VertexURL(srv.URL+"/v1", "p", "global", "gemini-test"),
+		http: srv.Client(),
+	}
+	_, err := client.Complete(context.Background(), sampleRequest())
+	if err == nil {
+		t.Fatal("a 403 should fail")
+	}
+	if !strings.Contains(err.Error(), "set-quota-project") {
+		t.Errorf("error should name the fix, got: %v", err)
 	}
 }

@@ -25,6 +25,11 @@ type googleClient struct {
 	http *http.Client
 	// apiKey is sent as x-goog-api-key. Empty when http handles auth.
 	apiKey string
+	// userProject is sent as x-goog-user-project, the project API usage is
+	// billed to when the URL does not already name one. Only ever a quota
+	// project the credentials themselves name: sending a project the caller
+	// lacks serviceusage.services.use on turns a working call into a 403.
+	userProject string
 	// notFoundHint is appended to 404s. A missing model is nearly always a
 	// region problem rather than a bad ID, and the provider knows which region
 	// it was pointed at while the caller does not.
@@ -128,6 +133,9 @@ func (g *googleClient) once(ctx context.Context, payload []byte) (text string, r
 	if g.apiKey != "" {
 		httpReq.Header.Set("x-goog-api-key", g.apiKey)
 	}
+	if g.userProject != "" {
+		httpReq.Header.Set(userProjectHeader, g.userProject)
+	}
 
 	resp, err := g.http.Do(httpReq)
 	if err != nil {
@@ -144,6 +152,9 @@ func (g *googleClient) once(ctx context.Context, payload []byte) (text string, r
 
 	if resp.StatusCode != http.StatusOK {
 		retry := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
+		if resp.StatusCode == http.StatusForbidden && mentionsQuotaProject(raw) {
+			return "", false, fmt.Errorf("%s: %s (%s)", g.name, quotaProjectHint, snippet(raw))
+		}
 		if resp.StatusCode == http.StatusNotFound {
 			hint := g.notFoundHint
 			if hint == "" {
@@ -188,6 +199,22 @@ func (g *googleClient) once(ctx context.Context, payload []byte) (text string, r
 		return "", false, fmt.Errorf("%s returned empty text (finish reason %q)", g.name, cand.FinishReason)
 	}
 	return out, false, nil
+}
+
+// userProjectHeader names the project API usage is billed to.
+const userProjectHeader = "x-goog-user-project"
+
+// quotaProjectHint is the fix for the one 403 that is not an IAM problem. It
+// covers both halves of it: a user login with no project to bill API usage to,
+// and one naming a quota project the caller may not use.
+const quotaProjectHint = "this credential needs a usable quota project — set one with " +
+	"`gcloud auth application-default set-quota-project <project>`"
+
+// mentionsQuotaProject reports whether a 403 is the missing-quota-project one
+// rather than a genuine permission failure.
+func mentionsQuotaProject(body []byte) bool {
+	s := strings.ToLower(string(body))
+	return strings.Contains(s, "quota project") || strings.Contains(s, "user project")
 }
 
 // snippet trims an error body to something loggable.

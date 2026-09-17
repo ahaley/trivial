@@ -62,6 +62,7 @@ func modelsCmd() *cobra.Command {
 			}
 
 			models, err := llm.ListVertexModels(cmd.Context(), llm.Options{
+				Project:         cfg.VertexProject,
 				Location:        cfg.VertexLocation,
 				CredentialsFile: cfg.VertexCredentials,
 			})
