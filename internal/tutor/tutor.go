@@ -50,7 +50,7 @@ func GradeMC(q model.Question, choice int) Verdict {
 	}
 	if choice < 0 || choice >= len(q.Options) {
 		return Verdict{Grade: model.GradeIncorrect,
-			Critique: fmt.Sprintf("No answer given. The correct option was %q.", correct)}
+			Critique: fmt.Sprintf("The correct option was %q.", correct)}
 	}
 	return Verdict{Grade: model.GradeIncorrect,
 		Critique: fmt.Sprintf("Not quite — you chose %q; the correct option was %q.",
@@ -66,7 +66,7 @@ func (t *Tutor) GradeOpen(ctx context.Context, subject string, f model.Fact, que
 	if response == "" {
 		return Verdict{
 			Grade:    model.GradeIncorrect,
-			Critique: fmt.Sprintf("No answer given. The answer is %s. %s", f.CanonicalAnswer, f.Explanation),
+			Critique: fmt.Sprintf("The answer is %s. %s", f.CanonicalAnswer, f.Explanation),
 		}
 	}
 
@@ -111,7 +111,7 @@ func GradeOpenLocal(f model.Fact, response string) Verdict {
 	if response == "" {
 		return Verdict{
 			Grade:    model.GradeIncorrect,
-			Critique: fmt.Sprintf("No answer given. The answer is %s. %s", f.CanonicalAnswer, f.Explanation),
+			Critique: fmt.Sprintf("The answer is %s. %s", f.CanonicalAnswer, f.Explanation),
 		}
 	}
 	switch sim := llm.Similarity(f.CanonicalAnswer, response); {
